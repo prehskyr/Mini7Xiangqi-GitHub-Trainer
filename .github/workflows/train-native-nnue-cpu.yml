@@ -54,6 +54,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate committed pipeline scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n native/scripts/timed_selfplay.sh
+          python -m py_compile             native/scripts/patch_trainer_cpu.py             native/scripts/patch_trainer_timer.py             native/scripts/patch_tools_engine.py
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -200,88 +207,9 @@ jobs:
 
       - name: Timed Mini7 self-play data generation
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data logs
-          : > data/fresh-train.bin
-
-          SELFPLAY_START="$(date +%s)"
-
-          cat > commands-validation.txt <<EOF
-          uci
-          setoption name UCI_Variant value mini7xiangqi
-          setoption name Use NNUE value false
-          setoption name Threads value 4
-          setoption name Hash value 1024
-          isready
-          generate_training_data depth ${{ inputs.search_depth }} count $VALIDATION_POSITIONS output_file_name $GITHUB_WORKSPACE/data/fresh-validation.bin random_move_min_ply 1 random_move_max_ply 18 random_move_count 5 random_multi_pv 4 random_multi_pv_diff 120 random_multi_pv_depth ${{ inputs.search_depth }} write_min_ply 4 write_max_ply 240 eval_limit 6000 keep_draws 0.40 filter_captures true filter_checks false filter_promotions false seed ${GITHUB_RUN_ID}-validation set_recommended_uci_options data_format bin
-          quit
-          EOF
-
-          tools/src/stockfish < commands-validation.txt \
-            2>&1 | tee logs/validation-generator.log
-          test -s data/fresh-validation.bin
-
-          CHUNK_INDEX=0
-          GENERATED_POSITIONS=0
-
-          while true; do
-            NOW="$(date +%s)"
-            CURRENT_BYTES="$(stat -c%s data/fresh-train.bin)"
-
-            if (( NOW >= SELFPLAY_DEADLINE - 20 )); then
-              echo "Self-play timer reached."
-              break
-            fi
-            if (( CURRENT_BYTES >= DATA_CAP_BYTES )); then
-              echo "Self-play data cap reached: ${CURRENT_BYTES} bytes."
-              break
-            fi
-
-            CHUNK_INDEX=$((CHUNK_INDEX + 1))
-            CHUNK_FILE="$GITHUB_WORKSPACE/data/chunk-${CHUNK_INDEX}.bin"
-
-            cat > "commands-chunk-${CHUNK_INDEX}.txt" <<EOF
-            uci
-            setoption name UCI_Variant value mini7xiangqi
-            setoption name Use NNUE value false
-            setoption name Threads value 4
-            setoption name Hash value 1024
-            isready
-            generate_training_data depth ${{ inputs.search_depth }} count $SELFPLAY_CHUNK_POSITIONS output_file_name $CHUNK_FILE random_move_min_ply 1 random_move_max_ply 18 random_move_count 5 random_multi_pv 4 random_multi_pv_diff 120 random_multi_pv_depth ${{ inputs.search_depth }} write_min_ply 4 write_max_ply 240 eval_limit 6000 keep_draws 0.40 filter_captures true filter_checks false filter_promotions false seed ${GITHUB_RUN_ID}-${CHUNK_INDEX} set_recommended_uci_options data_format bin
-            quit
-            EOF
-
-            tools/src/stockfish < "commands-chunk-${CHUNK_INDEX}.txt" \
-              >> logs/train-generator.log 2>&1
-
-            test -s "$CHUNK_FILE"
-            cat "$CHUNK_FILE" >> data/fresh-train.bin
-            rm -f "$CHUNK_FILE" "commands-chunk-${CHUNK_INDEX}.txt"
-
-            GENERATED_POSITIONS=$((GENERATED_POSITIONS + SELFPLAY_CHUNK_POSITIONS))
-
-            if (( CHUNK_INDEX % 10 == 0 )); then
-              CURRENT_BYTES="$(stat -c%s data/fresh-train.bin)"
-              echo "Self-play chunks=${CHUNK_INDEX}, positions=${GENERATED_POSITIONS}, bytes=${CURRENT_BYTES}"
-            fi
-          done
-
-          test -s data/fresh-train.bin
-
-          SELFPLAY_END="$(date +%s)"
-          SELFPLAY_ELAPSED=$((SELFPLAY_END - SELFPLAY_START))
-          FRESH_DATA_BYTES="$(stat -c%s data/fresh-train.bin)"
-
-          {
-            echo "GENERATED_POSITIONS=$GENERATED_POSITIONS"
-            echo "SELFPLAY_ELAPSED_SECONDS=$SELFPLAY_ELAPSED"
-            echo "FRESH_DATA_BYTES=$FRESH_DATA_BYTES"
-          } >> "$GITHUB_ENV"
-
-          echo "Fresh self-play positions: $GENERATED_POSITIONS"
-          echo "Fresh self-play bytes: $FRESH_DATA_BYTES"
-          echo "Self-play elapsed seconds: $SELFPLAY_ELAPSED"
+        env:
+          SEARCH_DEPTH: ${{ inputs.search_depth }}
+        run: bash native/scripts/timed_selfplay.sh
 
       - name: Prepare fresh self-play dataset and remaining timer
         run: |
