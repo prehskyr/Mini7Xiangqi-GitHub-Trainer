@@ -3,26 +3,30 @@ name: Train native Mini7 NNUE on GitHub CPU
 on:
   workflow_dispatch:
     inputs:
-      epoch_positions:
-        description: Positions processed in this training round
+      total_compute_minutes:
+        description: Timed self-play plus timed NNUE optimization (safe maximum 330)
         required: true
-        default: "200000"
-      validation_positions:
-        description: Positions processed during validation
+        default: "330"
+      selfplay_percent:
+        description: Percentage of compute time used to generate fresh self-play data
         required: true
-        default: "20000"
+        default: "70"
+      search_depth:
+        description: Fixed teacher search depth during self-play
+        required: true
+        default: "5"
       batch_size:
-        description: CPU batch size
+        description: CPU NNUE batch size
         required: true
         default: "64"
       lambda_eval:
         description: Loss mixture, 1=search score and 0=game result
         required: true
         default: "0.80"
-      learning_rate_note:
-        description: Informational label (optimizer LR is controlled by official model)
+      run_label:
+        description: Informational label
         required: false
-        default: "official-default"
+        default: "timed-selfplay-cpu"
 
 permissions:
   contents: write
@@ -36,11 +40,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
+      TOOLS_COMMIT: c8df2c39515a2654d5b52ba55b4ee585b20430a8
       TRAINER_COMMIT: b15df38a9aae8ab9b40b2378020b3099c7c5d179
       GH_TOKEN: ${{ github.token }}
       PYTHONUNBUFFERED: "1"
       OMP_NUM_THREADS: "4"
       MKL_NUM_THREADS: "4"
+      DATA_CAP_BYTES: "1500000000"
+      SELFPLAY_CHUNK_POSITIONS: "20000"
+      VALIDATION_POSITIONS: "20000"
+      NNUE_EPOCH_POSITIONS: "20000000"
 
     steps:
       - uses: actions/checkout@v4
@@ -49,103 +58,74 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git zstd
-
-      - name: Install CPU training dependencies
+      - name: Install build and CPU training dependencies
         run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git zstd
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.1.2"
           python -m pip install "numpy<2" chess matplotlib "pytorch-lightning==1.9.5" \
             "torchmetrics==0.11.4" tensorboard
 
-      - name: Fetch and patch pinned official trainer
+      - name: Fetch and build pinned self-play generator
         run: |
+          set -euo pipefail
+          git clone https://github.com/fairy-stockfish/variant-nnue-tools.git tools
+          git -C tools checkout "$TOOLS_COMMIT"
+          python3 native/scripts/patch_tools_engine.py tools
+          make -C tools/src -j2 ARCH=x86-64-modern COMP=gcc largeboards=yes nnue=no build
+
+      - name: Generate Mini7 trainer configuration
+        run: |
+          set -euo pipefail
+          mkdir -p generated-config
+          printf 'trainer_config mini7xiangqi %s\nquit\n' \
+            "$GITHUB_WORKSPACE/generated-config" | tools/src/stockfish
+          test -s generated-config/variant.h
+          test -s generated-config/variant.py
+
+      - name: Fetch, patch, and build pinned CPU trainer
+        run: |
+          set -euo pipefail
           git clone https://github.com/fairy-stockfish/variant-nnue-pytorch.git trainer
           git -C trainer checkout "$TRAINER_COMMIT"
           python native/scripts/patch_trainer_cpu.py trainer
+          python native/scripts/patch_trainer_timer.py trainer
 
-      - name: Download and install published Mini7 assets
-        run: |
-          set -euo pipefail
-          mkdir -p data release-config
-
-          gh release download mini7-native-data \
-            --pattern 'mini7-train-*.bin.zst' \
-            --dir data \
-            --clobber
-
-          gh release download mini7-native-data \
-            --pattern 'mini7-validation-*.bin.zst' \
-            --dir data \
-            --clobber
-
-          gh release download mini7-native-data \
-            --pattern 'variant.h' \
-            --dir release-config \
-            --clobber
-
-          gh release download mini7-native-data \
-            --pattern 'variant.py' \
-            --dir release-config \
-            --clobber
-
-          test -n "$(find data -name 'mini7-train-*.bin.zst' -print -quit)"
-          test -n "$(find data -name 'mini7-validation-*.bin.zst' -print -quit)"
-          test -s release-config/variant.h
-          test -s release-config/variant.py
-
-          install -m 0644 release-config/variant.h trainer/variant.h
-          install -m 0644 release-config/variant.py trainer/variant.py
+          install -m 0644 generated-config/variant.h trainer/variant.h
+          install -m 0644 generated-config/variant.py trainer/variant.py
           python -m py_compile trainer/variant.py
 
-      - name: Assemble binary datasets
-        run: |
-          set -euo pipefail
-          zstd -dc data/mini7-train-*.bin.zst > trainer/train.bin
-          zstd -dc data/mini7-validation-*.bin.zst > trainer/validation.bin
-          test -s trainer/train.bin
-          test -s trainer/validation.bin
-          ls -lh trainer/train.bin trainer/validation.bin
+          cmake -S trainer -B trainer/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/trainer"
+          cmake --build trainer/build --config Release --target install -j2
+          ls -l trainer/*training_data_loader*
 
-      - name: Build official fast data loader
-        working-directory: trainer
-        run: |
-          set -euo pipefail
-          cmake . -Bbuild -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD"
-          cmake --build build --config Release --target install -j2
-          ls -l *training_data_loader*
-
-      - name: Preflight patched trainer
+      - name: Preflight timed CPU trainer
         working-directory: trainer
         run: |
           set -euo pipefail
           python test_cpu_backend.py
           python train.py --help > train-help.txt
           python serialize.py --help > serialize-help.txt
-          grep -q -- '--accelerator' train-help.txt
-          grep -q -- '--batch-size' train-help.txt
-          grep -q -- '--features' train-help.txt
+          grep -q -- '--max-wall-seconds' train-help.txt
+          grep -q -- '--final-checkpoint' train-help.txt
           grep -q -- '--features' serialize-help.txt
 
-      - name: Restore checkpoint and plan exactly one additional epoch
-        env:
-          EPOCH_POSITIONS: ${{ inputs.epoch_positions }}
-          BATCH_SIZE: ${{ inputs.batch_size }}
+      - name: Restore latest checkpoint
         run: |
           set -euo pipefail
           mkdir -p resume
-
           gh release download mini7-native-nnue-state \
             --pattern 'latest.ckpt' \
             --dir resume \
             --clobber 2>/dev/null || true
 
           python - <<'PY'
-          import math
           import os
           from pathlib import Path
-
           import torch
 
           checkpoint = Path("resume/latest.ckpt")
@@ -153,136 +133,298 @@ jobs:
               state = torch.load(checkpoint, map_location="cpu")
               base_epoch = int(state.get("epoch", -1))
               base_global_step = int(state.get("global_step", 0))
-              target_max_epochs = base_epoch + 2
               resume_arg = f"--resume_from_checkpoint {checkpoint.resolve()}"
               resumed = 1
               print(
-                  f"Resume checkpoint: completed_epoch={base_epoch}, "
+                  f"Resume checkpoint: epoch={base_epoch}, "
                   f"global_step={base_global_step}"
               )
           else:
               base_epoch = -1
               base_global_step = 0
-              target_max_epochs = 1
               resume_arg = ""
               resumed = 0
               print("No checkpoint exists; starting the first native network.")
 
-          epoch_positions = int(os.environ["EPOCH_POSITIONS"])
-          batch_size = int(os.environ["BATCH_SIZE"])
-          expected_step_increment = math.ceil(epoch_positions / batch_size)
-
-          env_file = Path(os.environ["GITHUB_ENV"])
-          with env_file.open("a", encoding="utf-8") as f:
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as f:
               f.write(f"BASE_EPOCH={base_epoch}\n")
               f.write(f"BASE_GLOBAL_STEP={base_global_step}\n")
-              f.write(f"TARGET_MAX_EPOCHS={target_max_epochs}\n")
-              f.write(f"EXPECTED_STEP_INCREMENT={expected_step_increment}\n")
               f.write(f"RESUMED={resumed}\n")
               f.write(f"RESUME_ARG={resume_arg}\n")
-
-          print(
-              f"Training plan: target_max_epochs={target_max_epochs}, "
-              f"expected_new_steps={expected_step_increment}"
-          )
           PY
 
-      - name: Train exactly one resumable CPU epoch
+      - name: Plan wall-clock compute budget
+        env:
+          TOTAL_MINUTES_INPUT: ${{ inputs.total_compute_minutes }}
+          SELFPLAY_PERCENT_INPUT: ${{ inputs.selfplay_percent }}
+        run: |
+          set -euo pipefail
+
+          TOTAL_MINUTES="$TOTAL_MINUTES_INPUT"
+          SELFPLAY_PERCENT="$SELFPLAY_PERCENT_INPUT"
+
+          [[ "$TOTAL_MINUTES" =~ ^[0-9]+$ ]] || {
+            echo "::error::total_compute_minutes must be an integer"
+            exit 1
+          }
+          [[ "$SELFPLAY_PERCENT" =~ ^[0-9]+$ ]] || {
+            echo "::error::selfplay_percent must be an integer"
+            exit 1
+          }
+
+          if (( TOTAL_MINUTES < 30 || TOTAL_MINUTES > 330 )); then
+            echo "::error::total_compute_minutes must be between 30 and 330"
+            exit 1
+          fi
+          if (( SELFPLAY_PERCENT < 10 || SELFPLAY_PERCENT > 90 )); then
+            echo "::error::selfplay_percent must be between 10 and 90"
+            exit 1
+          fi
+
+          COMPUTE_START="$(date +%s)"
+          COMPUTE_DEADLINE=$((COMPUTE_START + TOTAL_MINUTES * 60))
+          SELFPLAY_SECONDS=$((TOTAL_MINUTES * 60 * SELFPLAY_PERCENT / 100))
+          SELFPLAY_DEADLINE=$((COMPUTE_START + SELFPLAY_SECONDS))
+
+          {
+            echo "COMPUTE_START=$COMPUTE_START"
+            echo "COMPUTE_DEADLINE=$COMPUTE_DEADLINE"
+            echo "SELFPLAY_DEADLINE=$SELFPLAY_DEADLINE"
+            echo "TOTAL_COMPUTE_MINUTES=$TOTAL_MINUTES"
+            echo "SELFPLAY_PERCENT=$SELFPLAY_PERCENT"
+          } >> "$GITHUB_ENV"
+
+          echo "Timed compute budget: ${TOTAL_MINUTES} minutes"
+          echo "Planned self-play share: ${SELFPLAY_PERCENT}%"
+          echo "No model checkpoint will be written during timed optimization."
+
+      - name: Timed Mini7 self-play data generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data logs
+          : > data/fresh-train.bin
+
+          SELFPLAY_START="$(date +%s)"
+
+          cat > commands-validation.txt <<EOF
+          uci
+          setoption name UCI_Variant value mini7xiangqi
+          setoption name Use NNUE value false
+          setoption name Threads value 4
+          setoption name Hash value 1024
+          isready
+          generate_training_data depth ${{ inputs.search_depth }} count $VALIDATION_POSITIONS output_file_name $GITHUB_WORKSPACE/data/fresh-validation.bin random_move_min_ply 1 random_move_max_ply 18 random_move_count 5 random_multi_pv 4 random_multi_pv_diff 120 random_multi_pv_depth ${{ inputs.search_depth }} write_min_ply 4 write_max_ply 240 eval_limit 6000 keep_draws 0.40 filter_captures true filter_checks false filter_promotions false seed ${GITHUB_RUN_ID}-validation set_recommended_uci_options data_format bin
+          quit
+          EOF
+
+          tools/src/stockfish < commands-validation.txt \
+            2>&1 | tee logs/validation-generator.log
+          test -s data/fresh-validation.bin
+
+          CHUNK_INDEX=0
+          GENERATED_POSITIONS=0
+
+          while true; do
+            NOW="$(date +%s)"
+            CURRENT_BYTES="$(stat -c%s data/fresh-train.bin)"
+
+            if (( NOW >= SELFPLAY_DEADLINE - 20 )); then
+              echo "Self-play timer reached."
+              break
+            fi
+            if (( CURRENT_BYTES >= DATA_CAP_BYTES )); then
+              echo "Self-play data cap reached: ${CURRENT_BYTES} bytes."
+              break
+            fi
+
+            CHUNK_INDEX=$((CHUNK_INDEX + 1))
+            CHUNK_FILE="$GITHUB_WORKSPACE/data/chunk-${CHUNK_INDEX}.bin"
+
+            cat > "commands-chunk-${CHUNK_INDEX}.txt" <<EOF
+            uci
+            setoption name UCI_Variant value mini7xiangqi
+            setoption name Use NNUE value false
+            setoption name Threads value 4
+            setoption name Hash value 1024
+            isready
+            generate_training_data depth ${{ inputs.search_depth }} count $SELFPLAY_CHUNK_POSITIONS output_file_name $CHUNK_FILE random_move_min_ply 1 random_move_max_ply 18 random_move_count 5 random_multi_pv 4 random_multi_pv_diff 120 random_multi_pv_depth ${{ inputs.search_depth }} write_min_ply 4 write_max_ply 240 eval_limit 6000 keep_draws 0.40 filter_captures true filter_checks false filter_promotions false seed ${GITHUB_RUN_ID}-${CHUNK_INDEX} set_recommended_uci_options data_format bin
+            quit
+            EOF
+
+            tools/src/stockfish < "commands-chunk-${CHUNK_INDEX}.txt" \
+              >> logs/train-generator.log 2>&1
+
+            test -s "$CHUNK_FILE"
+            cat "$CHUNK_FILE" >> data/fresh-train.bin
+            rm -f "$CHUNK_FILE" "commands-chunk-${CHUNK_INDEX}.txt"
+
+            GENERATED_POSITIONS=$((GENERATED_POSITIONS + SELFPLAY_CHUNK_POSITIONS))
+
+            if (( CHUNK_INDEX % 10 == 0 )); then
+              CURRENT_BYTES="$(stat -c%s data/fresh-train.bin)"
+              echo "Self-play chunks=${CHUNK_INDEX}, positions=${GENERATED_POSITIONS}, bytes=${CURRENT_BYTES}"
+            fi
+          done
+
+          test -s data/fresh-train.bin
+
+          SELFPLAY_END="$(date +%s)"
+          SELFPLAY_ELAPSED=$((SELFPLAY_END - SELFPLAY_START))
+          FRESH_DATA_BYTES="$(stat -c%s data/fresh-train.bin)"
+
+          {
+            echo "GENERATED_POSITIONS=$GENERATED_POSITIONS"
+            echo "SELFPLAY_ELAPSED_SECONDS=$SELFPLAY_ELAPSED"
+            echo "FRESH_DATA_BYTES=$FRESH_DATA_BYTES"
+          } >> "$GITHUB_ENV"
+
+          echo "Fresh self-play positions: $GENERATED_POSITIONS"
+          echo "Fresh self-play bytes: $FRESH_DATA_BYTES"
+          echo "Self-play elapsed seconds: $SELFPLAY_ELAPSED"
+
+      - name: Prepare fresh self-play dataset and remaining timer
+        run: |
+          set -euo pipefail
+
+          cp data/fresh-train.bin trainer/train.bin
+          cp data/fresh-validation.bin trainer/validation.bin
+          test -s trainer/train.bin
+          test -s trainer/validation.bin
+
+          NOW="$(date +%s)"
+          TRAIN_SECONDS=$((COMPUTE_DEADLINE - NOW))
+
+          if (( TRAIN_SECONDS < 60 )); then
+            echo "::error::Less than 60 seconds remain for NNUE optimization."
+            exit 1
+          fi
+
+          echo "TRAIN_SECONDS=$TRAIN_SECONDS" >> "$GITHUB_ENV"
+          echo "NNUE optimization wall-clock budget: $TRAIN_SECONDS seconds"
+          ls -lh trainer/train.bin trainer/validation.bin
+
+      - name: Timed NNUE optimization with one final save
         working-directory: trainer
         shell: bash
         run: |
           set -euo pipefail
+          TRAIN_START="$(date +%s)"
 
           python train.py train.bin validation.bin \
             --accelerator cpu \
             --devices 1 \
-            --max_epochs "$TARGET_MAX_EPOCHS" \
+            --max_epochs -1 \
             --batch-size '${{ inputs.batch_size }}' \
             --threads 4 \
             --num-workers 0 \
-            --epoch-size '${{ inputs.epoch_positions }}' \
-            --validation-size '${{ inputs.validation_positions }}' \
+            --epoch-size "$NNUE_EPOCH_POSITIONS" \
+            --validation-size "$VALIDATION_POSITIONS" \
             --random-fen-skipping 0 \
             --lambda '${{ inputs.lambda_eval }}' \
             --features 'HalfKAv2^' \
             --default_root_dir "$GITHUB_WORKSPACE/training-run" \
-            --log_every_n_steps 10 \
+            --log_every_n_steps 100 \
+            --max-wall-seconds "$TRAIN_SECONDS" \
+            --final-checkpoint "$GITHUB_WORKSPACE/latest.ckpt" \
             $RESUME_ARG
 
-      - name: Select checkpoint, verify progress, and serialize native NNUE
+          TRAIN_END="$(date +%s)"
+          TRAIN_ELAPSED=$((TRAIN_END - TRAIN_START))
+          echo "TRAIN_ELAPSED_SECONDS=$TRAIN_ELAPSED" >> "$GITHUB_ENV"
+          test -s "$GITHUB_WORKSPACE/latest.ckpt"
+
+      - name: Verify progress and serialize native NNUE
         run: |
           set -euo pipefail
+          export LATEST_CHECKPOINT="$GITHUB_WORKSPACE/latest.ckpt"
 
-          CHECKPOINT="$(find training-run -name '*.ckpt' -type f -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
-
-          if test -z "$CHECKPOINT"; then
-            echo "::error::Training returned without writing a new checkpoint."
-            find training-run -maxdepth 6 -type f -print || true
-            exit 1
-          fi
-
-          export CHECKPOINT
-          python - <<'PY'
+          read -r ENDING_EPOCH ENDING_GLOBAL_STEP < <(
+            python - <<'PY'
           import os
           import torch
 
-          path = os.environ["CHECKPOINT"]
-          state = torch.load(path, map_location="cpu")
-          new_epoch = int(state.get("epoch", -1))
-          new_global_step = int(state.get("global_step", 0))
-          base_epoch = int(os.environ["BASE_EPOCH"])
-          base_global_step = int(os.environ["BASE_GLOBAL_STEP"])
-          target_epoch = int(os.environ["TARGET_MAX_EPOCHS"]) - 1
-
-          print(
-              f"New checkpoint: epoch={new_epoch}, global_step={new_global_step}; "
-              f"previous epoch={base_epoch}, previous global_step={base_global_step}"
+          state = torch.load(os.environ["LATEST_CHECKPOINT"], map_location="cpu")
+          print(int(state.get("epoch", -1)), int(state.get("global_step", 0)))
+          PY
           )
 
-          if new_epoch < target_epoch:
-              raise RuntimeError(
-                  f"Checkpoint epoch did not advance to target: "
-                  f"new={new_epoch}, target={target_epoch}"
-              )
-          if new_global_step <= base_global_step:
-              raise RuntimeError(
-                  f"Checkpoint global_step did not advance: "
-                  f"new={new_global_step}, previous={base_global_step}"
-              )
-          PY
+          if (( ENDING_GLOBAL_STEP <= BASE_GLOBAL_STEP )); then
+            echo "::error::Timed training did not advance global_step."
+            exit 1
+          fi
 
-          cp "$CHECKPOINT" latest.ckpt
+          {
+            echo "ENDING_EPOCH=$ENDING_EPOCH"
+            echo "ENDING_GLOBAL_STEP=$ENDING_GLOBAL_STEP"
+          } >> "$GITHUB_ENV"
+
+          echo "Checkpoint progress: ${BASE_GLOBAL_STEP} -> ${ENDING_GLOBAL_STEP}"
 
           cd trainer
           python serialize.py \
             "$GITHUB_WORKSPACE/latest.ckpt" \
             "$GITHUB_WORKSPACE/mini7xiangqi-candidate.nnue" \
             --features 'HalfKAv2^' \
-            --description "Mini7 native NNUE GitHub run ${GITHUB_RUN_NUMBER}"
+            --description "Mini7 timed self-play NNUE run ${GITHUB_RUN_NUMBER}"
 
           test -s "$GITHUB_WORKSPACE/mini7xiangqi-candidate.nnue"
 
-      - name: Build native engine and load-test exported network
+      - name: Build native engine and verify exported network
         working-directory: native/engine/src
         run: make -j2 ARCH=x86-64-modern COMP=gcc largeboards=yes nnue=no build
 
       - name: Verify NNUE inside the search tree
         run: python3 native/scripts/verify_nnue_load.py native/engine/src/stockfish mini7xiangqi-candidate.nnue
 
-      - name: Record training state
+      - name: Compress and publish fresh self-play shard
         run: |
           set -euo pipefail
+          TRAIN_NAME="mini7-train-timed-run-${GITHUB_RUN_NUMBER}.bin.zst"
+          VAL_NAME="mini7-validation-timed-run-${GITHUB_RUN_NUMBER}.bin.zst"
 
-          export LATEST_CHECKPOINT="$GITHUB_WORKSPACE/latest.ckpt"
-          read -r ENDING_EPOCH ENDING_GLOBAL_STEP < <(
-            python - <<'PY'
-          import os
-          import torch
-          state = torch.load(os.environ["LATEST_CHECKPOINT"], map_location="cpu")
-          print(int(state.get("epoch", -1)), int(state.get("global_step", 0)))
-          PY
-          )
+          zstd -T0 -6 data/fresh-train.bin -o "$TRAIN_NAME"
+          zstd -T0 -6 data/fresh-validation.bin -o "$VAL_NAME"
+          sha256sum "$TRAIN_NAME" "$VAL_NAME" > DATA_SHA256SUMS.txt
 
+          cat > data-metadata.json <<EOF
+          {
+            "run_number": ${GITHUB_RUN_NUMBER},
+            "run_id": ${GITHUB_RUN_ID},
+            "source_commit": "${GITHUB_SHA}",
+            "tools_commit": "${TOOLS_COMMIT}",
+            "variant": "mini7xiangqi",
+            "generated_positions": ${GENERATED_POSITIONS},
+            "raw_training_bytes": ${FRESH_DATA_BYTES},
+            "search_depth": ${{ inputs.search_depth }},
+            "selfplay_elapsed_seconds": ${SELFPLAY_ELAPSED_SECONDS},
+            "generator": "engine-self-play"
+          }
+          EOF
+
+          gh release view mini7-native-data >/dev/null 2>&1 || \
+            gh release create mini7-native-data \
+              --target "$GITHUB_SHA" \
+              --title "Mini7 native NNUE data" \
+              --notes "Rolling native mini7xiangqi self-play data shards."
+
+          gh release upload mini7-native-data \
+            "$TRAIN_NAME" \
+            "$VAL_NAME" \
+            generated-config/variant.h \
+            generated-config/variant.py \
+            data-metadata.json \
+            DATA_SHA256SUMS.txt \
+            --clobber
+
+          {
+            echo "TRAIN_NAME=$TRAIN_NAME"
+            echo "VAL_NAME=$VAL_NAME"
+          } >> "$GITHUB_ENV"
+
+      - name: Record and publish one final training state
+        run: |
+          set -euo pipefail
           sha256sum latest.ckpt mini7xiangqi-candidate.nnue > SHA256SUMS.txt
 
           cat > native-training-state.json <<EOF
@@ -292,23 +434,23 @@ jobs:
             "source_commit": "${GITHUB_SHA}",
             "trainer_commit": "${TRAINER_COMMIT}",
             "variant": "mini7xiangqi",
-            "epoch_positions": ${{ inputs.epoch_positions }},
-            "validation_positions": ${{ inputs.validation_positions }},
+            "run_label": "${{ inputs.run_label }}",
+            "total_compute_minutes": ${TOTAL_COMPUTE_MINUTES},
+            "selfplay_percent": ${SELFPLAY_PERCENT},
+            "selfplay_elapsed_seconds": ${SELFPLAY_ELAPSED_SECONDS},
+            "training_elapsed_seconds": ${TRAIN_ELAPSED_SECONDS},
+            "generated_positions": ${GENERATED_POSITIONS},
             "batch_size": ${{ inputs.batch_size }},
             "lambda_eval": ${{ inputs.lambda_eval }},
-            "backend": "github-hosted-cpu",
             "resumed": ${RESUMED},
             "starting_epoch": ${BASE_EPOCH},
             "ending_epoch": ${ENDING_EPOCH},
             "starting_global_step": ${BASE_GLOBAL_STEP},
             "ending_global_step": ${ENDING_GLOBAL_STEP},
+            "checkpoint_policy": "one final save only",
             "network": "mini7xiangqi-candidate.nnue"
           }
           EOF
-
-      - name: Publish rolling checkpoint and candidate network
-        run: |
-          set -euo pipefail
 
           gh release view mini7-native-nnue-state >/dev/null 2>&1 || \
             gh release create mini7-native-nnue-state \
@@ -325,12 +467,15 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mini7-native-nnue-run-${{ github.run_number }}
+          name: mini7-native-timed-run-${{ github.run_number }}
           path: |
             latest.ckpt
             mini7xiangqi-candidate.nnue
             native-training-state.json
             SHA256SUMS.txt
+            data-metadata.json
+            DATA_SHA256SUMS.txt
             training-run/lightning_logs/**
+            logs/*.log
           if-no-files-found: error
           retention-days: 30
