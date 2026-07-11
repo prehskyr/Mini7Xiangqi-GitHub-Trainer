@@ -97,9 +97,7 @@ jobs:
 
           install -m 0644 release-config/variant.h trainer/variant.h
           install -m 0644 release-config/variant.py trainer/variant.py
-
           python -m py_compile trainer/variant.py
-          sha256sum release-config/variant.h release-config/variant.py
 
       - name: Assemble binary datasets
         run: |
@@ -130,31 +128,75 @@ jobs:
           grep -q -- '--features' train-help.txt
           grep -q -- '--features' serialize-help.txt
 
-      - name: Restore latest checkpoint when available
+      - name: Restore checkpoint and plan exactly one additional epoch
+        env:
+          EPOCH_POSITIONS: ${{ inputs.epoch_positions }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
         run: |
+          set -euo pipefail
           mkdir -p resume
+
           gh release download mini7-native-nnue-state \
             --pattern 'latest.ckpt' \
             --dir resume \
             --clobber 2>/dev/null || true
 
-          if test -s resume/latest.ckpt; then
-            echo "RESUME_ARG=--resume_from_checkpoint $GITHUB_WORKSPACE/resume/latest.ckpt" >> "$GITHUB_ENV"
-            echo "Resuming from the previous checkpoint."
-          else
-            echo "RESUME_ARG=" >> "$GITHUB_ENV"
-            echo "No checkpoint exists; starting the first native network."
-          fi
+          python - <<'PY'
+          import math
+          import os
+          from pathlib import Path
 
-      - name: Train one resumable CPU round
+          import torch
+
+          checkpoint = Path("resume/latest.ckpt")
+          if checkpoint.is_file() and checkpoint.stat().st_size > 0:
+              state = torch.load(checkpoint, map_location="cpu")
+              base_epoch = int(state.get("epoch", -1))
+              base_global_step = int(state.get("global_step", 0))
+              target_max_epochs = base_epoch + 2
+              resume_arg = f"--resume_from_checkpoint {checkpoint.resolve()}"
+              resumed = 1
+              print(
+                  f"Resume checkpoint: completed_epoch={base_epoch}, "
+                  f"global_step={base_global_step}"
+              )
+          else:
+              base_epoch = -1
+              base_global_step = 0
+              target_max_epochs = 1
+              resume_arg = ""
+              resumed = 0
+              print("No checkpoint exists; starting the first native network.")
+
+          epoch_positions = int(os.environ["EPOCH_POSITIONS"])
+          batch_size = int(os.environ["BATCH_SIZE"])
+          expected_step_increment = math.ceil(epoch_positions / batch_size)
+
+          env_file = Path(os.environ["GITHUB_ENV"])
+          with env_file.open("a", encoding="utf-8") as f:
+              f.write(f"BASE_EPOCH={base_epoch}\n")
+              f.write(f"BASE_GLOBAL_STEP={base_global_step}\n")
+              f.write(f"TARGET_MAX_EPOCHS={target_max_epochs}\n")
+              f.write(f"EXPECTED_STEP_INCREMENT={expected_step_increment}\n")
+              f.write(f"RESUMED={resumed}\n")
+              f.write(f"RESUME_ARG={resume_arg}\n")
+
+          print(
+              f"Training plan: target_max_epochs={target_max_epochs}, "
+              f"expected_new_steps={expected_step_increment}"
+          )
+          PY
+
+      - name: Train exactly one resumable CPU epoch
         working-directory: trainer
         shell: bash
         run: |
           set -euo pipefail
+
           python train.py train.bin validation.bin \
             --accelerator cpu \
             --devices 1 \
-            --max_epochs 1 \
+            --max_epochs "$TARGET_MAX_EPOCHS" \
             --batch-size '${{ inputs.batch_size }}' \
             --threads 4 \
             --num-workers 0 \
@@ -167,11 +209,48 @@ jobs:
             --log_every_n_steps 10 \
             $RESUME_ARG
 
-      - name: Select checkpoint and serialize native NNUE
+      - name: Select checkpoint, verify progress, and serialize native NNUE
         run: |
           set -euo pipefail
+
           CHECKPOINT="$(find training-run -name '*.ckpt' -type f -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
-          test -n "$CHECKPOINT"
+
+          if test -z "$CHECKPOINT"; then
+            echo "::error::Training returned without writing a new checkpoint."
+            find training-run -maxdepth 6 -type f -print || true
+            exit 1
+          fi
+
+          export CHECKPOINT
+          python - <<'PY'
+          import os
+          import torch
+
+          path = os.environ["CHECKPOINT"]
+          state = torch.load(path, map_location="cpu")
+          new_epoch = int(state.get("epoch", -1))
+          new_global_step = int(state.get("global_step", 0))
+          base_epoch = int(os.environ["BASE_EPOCH"])
+          base_global_step = int(os.environ["BASE_GLOBAL_STEP"])
+          target_epoch = int(os.environ["TARGET_MAX_EPOCHS"]) - 1
+
+          print(
+              f"New checkpoint: epoch={new_epoch}, global_step={new_global_step}; "
+              f"previous epoch={base_epoch}, previous global_step={base_global_step}"
+          )
+
+          if new_epoch < target_epoch:
+              raise RuntimeError(
+                  f"Checkpoint epoch did not advance to target: "
+                  f"new={new_epoch}, target={target_epoch}"
+              )
+          if new_global_step <= base_global_step:
+              raise RuntimeError(
+                  f"Checkpoint global_step did not advance: "
+                  f"new={new_global_step}, previous={base_global_step}"
+              )
+          PY
+
           cp "$CHECKPOINT" latest.ckpt
 
           cd trainer
@@ -192,7 +271,20 @@ jobs:
 
       - name: Record training state
         run: |
+          set -euo pipefail
+
+          export LATEST_CHECKPOINT="$GITHUB_WORKSPACE/latest.ckpt"
+          read -r ENDING_EPOCH ENDING_GLOBAL_STEP < <(
+            python - <<'PY'
+          import os
+          import torch
+          state = torch.load(os.environ["LATEST_CHECKPOINT"], map_location="cpu")
+          print(int(state.get("epoch", -1)), int(state.get("global_step", 0)))
+          PY
+          )
+
           sha256sum latest.ckpt mini7xiangqi-candidate.nnue > SHA256SUMS.txt
+
           cat > native-training-state.json <<EOF
           {
             "run_number": ${GITHUB_RUN_NUMBER},
@@ -205,12 +297,19 @@ jobs:
             "batch_size": ${{ inputs.batch_size }},
             "lambda_eval": ${{ inputs.lambda_eval }},
             "backend": "github-hosted-cpu",
+            "resumed": ${RESUMED},
+            "starting_epoch": ${BASE_EPOCH},
+            "ending_epoch": ${ENDING_EPOCH},
+            "starting_global_step": ${BASE_GLOBAL_STEP},
+            "ending_global_step": ${ENDING_GLOBAL_STEP},
             "network": "mini7xiangqi-candidate.nnue"
           }
           EOF
 
       - name: Publish rolling checkpoint and candidate network
         run: |
+          set -euo pipefail
+
           gh release view mini7-native-nnue-state >/dev/null 2>&1 || \
             gh release create mini7-native-nnue-state \
               --target "$GITHUB_SHA" \
@@ -233,4 +332,5 @@ jobs:
             native-training-state.json
             SHA256SUMS.txt
             training-run/lightning_logs/**
+          if-no-files-found: error
           retention-days: 30
