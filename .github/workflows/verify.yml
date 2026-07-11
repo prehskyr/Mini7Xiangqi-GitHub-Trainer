@@ -1,0 +1,66 @@
+name: Verify trainer
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build-and-smoke-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify engine
+        shell: pwsh
+        run: ./scripts/verify-engine.ps1
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+      - name: Unit tests
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: One-update CLI smoke test
+        shell: pwsh
+        run: |
+          & .\build\bin\Mini7TrainerCLI.exe `
+            --engine .\build\bin\MockUciEngine.exe `
+            --variants .\config\variants.ini `
+            --model "$env:RUNNER_TEMP\smoke.m7nnue" `
+            --game-log "$env:RUNNER_TEMP\smoke-games.jsonl" `
+            --summary "$env:RUNNER_TEMP\smoke.json" `
+            --duration-seconds 30 `
+            --max-training-steps 1 `
+            --max-games 1 `
+            --movetime-ms 20 `
+            --threads 1 `
+            --hash-mb 16 `
+            --checkpoint-plies 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $summary = Get-Content "$env:RUNNER_TEMP\smoke.json" -Raw | ConvertFrom-Json
+          if ([int64]$summary.ending_steps -ne 1) { throw "Expected exactly one training update." }
+
+          & .\build\bin\Mini7TrainerCLI.exe `
+            --engine .\build\bin\MockUciEngine.exe `
+            --variants .\config\variants.ini `
+            --model "$env:RUNNER_TEMP\smoke.m7nnue" `
+            --game-log "$env:RUNNER_TEMP\smoke-games.jsonl" `
+            --summary "$env:RUNNER_TEMP\smoke.json" `
+            --duration-seconds 30 `
+            --max-training-steps 1 `
+            --max-games 1 `
+            --movetime-ms 20 `
+            --threads 1 `
+            --hash-mb 16 `
+            --checkpoint-plies 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $summary = Get-Content "$env:RUNNER_TEMP\smoke.json" -Raw | ConvertFrom-Json
+          if ([int64]$summary.starting_steps -ne 1 -or [int64]$summary.ending_steps -ne 2) {
+            throw "Checkpoint resume smoke test failed."
+          }

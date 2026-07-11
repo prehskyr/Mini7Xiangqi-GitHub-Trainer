@@ -1,0 +1,250 @@
+name: Train Mini7 for a 6-hour window
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Actual training minutes (safe maximum: 345)"
+        required: true
+        default: "340"
+        type: string
+      threads:
+        description: "Fairy-Stockfish Threads (standard Windows runner has 4 vCPU)"
+        required: true
+        default: "4"
+        type: string
+      hash_mb:
+        description: "Fairy-Stockfish Hash in MB"
+        required: true
+        default: "1024"
+        type: string
+      movetime_ms:
+        description: "Teacher search time per move in milliseconds"
+        required: true
+        default: "120"
+        type: string
+      max_plies:
+        description: "Maximum plies per self-play game"
+        required: true
+        default: "240"
+        type: string
+      multipv:
+        description: "Number of Fairy-Stockfish candidate moves"
+        required: true
+        default: "5"
+        type: choice
+        options:
+          - "1"
+          - "3"
+          - "5"
+      learning_rate:
+        description: "Client network learning rate"
+        required: true
+        default: "0.002"
+        type: string
+      net_blend_percent:
+        description: "Client network weight when selecting self-play moves"
+        required: true
+        default: "20"
+        type: string
+      max_games:
+        description: "Safety cap; time normally stops the run first"
+        required: true
+        default: "1000000"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mini7-training-state
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: windows-latest
+    timeout-minutes: 358
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Restore latest checkpoint from training-state branch
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force models, logs, state | Out-Null
+          git fetch origin training-state:refs/remotes/origin/training-state 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            git cat-file -e "origin/training-state:models/mini7-current.m7nnue" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              git restore --source=origin/training-state --worktree -- models/mini7-current.m7nnue
+              Write-Host "Restored models/mini7-current.m7nnue from training-state."
+            } else {
+              Write-Host "training-state exists but has no checkpoint; starting fresh."
+            }
+          } else {
+            Write-Host "No training-state branch yet; first run will initialize a model."
+          }
+          exit 0
+
+      - name: Verify bundled Fairy-Stockfish binary
+        shell: pwsh
+        run: ./scripts/verify-engine.ps1
+
+      - name: Configure MSVC build
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build trainer and tests
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Run native rule and model tests
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Run one-update headless smoke test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\mini7-smoke" | Out-Null
+          & .\build\bin\Mini7TrainerCLI.exe `
+            --engine .\build\bin\MockUciEngine.exe `
+            --variants .\config\variants.ini `
+            --model "$env:RUNNER_TEMP\mini7-smoke\smoke.m7nnue" `
+            --game-log "$env:RUNNER_TEMP\mini7-smoke\games.jsonl" `
+            --summary "$env:RUNNER_TEMP\mini7-smoke\latest.json" `
+            --duration-seconds 30 `
+            --max-training-steps 1 `
+            --max-games 1 `
+            --movetime-ms 20 `
+            --threads 1 `
+            --hash-mb 16 `
+            --checkpoint-plies 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $summary = Get-Content "$env:RUNNER_TEMP\mini7-smoke\latest.json" -Raw | ConvertFrom-Json
+          if ([int64]$summary.ending_steps -ne 1) { throw "Smoke test did not execute exactly one update." }
+
+          & .\build\bin\Mini7TrainerCLI.exe `
+            --engine .\build\bin\MockUciEngine.exe `
+            --variants .\config\variants.ini `
+            --model "$env:RUNNER_TEMP\mini7-smoke\smoke.m7nnue" `
+            --game-log "$env:RUNNER_TEMP\mini7-smoke\games.jsonl" `
+            --summary "$env:RUNNER_TEMP\mini7-smoke\latest.json" `
+            --duration-seconds 30 `
+            --max-training-steps 1 `
+            --max-games 1 `
+            --movetime-ms 20 `
+            --threads 1 `
+            --hash-mb 16 `
+            --checkpoint-plies 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $summary = Get-Content "$env:RUNNER_TEMP\mini7-smoke\latest.json" -Raw | ConvertFrom-Json
+          if ([int64]$summary.starting_steps -ne 1 -or [int64]$summary.ending_steps -ne 2) {
+            throw "Smoke test did not resume the saved checkpoint."
+          }
+
+      - name: Train with Fairy-Stockfish
+        id: train
+        shell: pwsh
+        run: |
+          $durationMinutes = [Math]::Max(5, [Math]::Min(345, [int]"${{ inputs.duration_minutes }}"))
+          $durationSeconds = $durationMinutes * 60
+          $threads = [Math]::Max(1, [Math]::Min(4, [int]"${{ inputs.threads }}"))
+          $hashMb = [Math]::Max(16, [Math]::Min(4096, [int]"${{ inputs.hash_mb }}"))
+          $movetime = [Math]::Max(20, [Math]::Min(5000, [int]"${{ inputs.movetime_ms }}"))
+          $maxPlies = [Math]::Max(20, [Math]::Min(2000, [int]"${{ inputs.max_plies }}"))
+          $multiPv = [Math]::Max(1, [Math]::Min(5, [int]"${{ inputs.multipv }}"))
+          $blend = [Math]::Max(0, [Math]::Min(100, [int]"${{ inputs.net_blend_percent }}"))
+          $maxGames = [Math]::Max(1, [Math]::Min(100000000, [int]"${{ inputs.max_games }}"))
+          $learningRate = "${{ inputs.learning_rate }}"
+
+          New-Item -ItemType Directory -Force models, logs, state | Out-Null
+          Write-Host "Starting $durationMinutes minutes of training."
+          & .\build\bin\Mini7TrainerCLI.exe `
+            --engine .\engine\fairy-stockfish.exe `
+            --variants .\config\variants.ini `
+            --model .\models\mini7-current.m7nnue `
+            --game-log .\logs\games.jsonl `
+            --summary .\state\latest.json `
+            --duration-seconds $durationSeconds `
+            --max-games $maxGames `
+            --max-plies $maxPlies `
+            --movetime-ms $movetime `
+            --threads $threads `
+            --hash-mb $hashMb `
+            --multipv $multiPv `
+            --net-blend-percent $blend `
+            --learning-rate $learningRate `
+            --checkpoint-plies 20
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage outputs for download
+        if: always()
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\mini7-training-output"
+          New-Item -ItemType Directory -Force "$out\models", "$out\logs", "$out\state" | Out-Null
+          if (Test-Path .\models\mini7-current.m7nnue) { Copy-Item .\models\mini7-current.m7nnue "$out\models\" -Force }
+          if (Test-Path .\logs\games.jsonl) { Copy-Item .\logs\games.jsonl "$out\logs\" -Force }
+          if (Test-Path .\state\latest.json) { Copy-Item .\state\latest.json "$out\state\" -Force }
+          Get-ChildItem -Recurse $out
+
+      - name: Upload model and logs as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini7-training-run-${{ github.run_number }}
+          path: ${{ runner.temp }}/mini7-training-output
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+      - name: Publish latest checkpoint to training-state branch
+        if: success()
+        shell: pwsh
+        run: |
+          $out = "$env:RUNNER_TEMP\mini7-training-output"
+          if (!(Test-Path "$out\models\mini7-current.m7nnue")) { throw "No checkpoint was produced." }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git reset --hard
+          git clean -fdx
+          git fetch origin training-state:refs/remotes/origin/training-state 2>$null
+          $hasState = $LASTEXITCODE -eq 0
+
+          if ($hasState) {
+            git switch -C training-state origin/training-state
+          } else {
+            git switch --orphan training-state
+            git rm -rf --ignore-unmatch . | Out-Null
+            Get-ChildItem -Force | Where-Object { $_.Name -ne '.git' } | Remove-Item -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force models, state | Out-Null
+          Copy-Item "$out\models\mini7-current.m7nnue" .\models\mini7-current.m7nnue -Force
+          Copy-Item "$out\state\latest.json" .\state\latest.json -Force
+
+          if (!(Test-Path .\state\history.md)) {
+            "# Training history`n`n| Run | UTC | Games | Steps | Stop reason |`n|---:|---|---:|---:|---|" | Set-Content .\state\history.md -Encoding utf8
+          }
+          $summary = Get-Content .\state\latest.json -Raw | ConvertFrom-Json
+          $utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+          "| ${{ github.run_number }} | $utc | $($summary.games_completed) | $($summary.starting_steps) -> $($summary.ending_steps) | $($summary.stop_reason) |" | Add-Content .\state\history.md -Encoding utf8
+
+          git add models/mini7-current.m7nnue state/latest.json state/history.md
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Checkpoint is unchanged; nothing to commit."
+            exit 0
+          }
+          git commit -m "training: update checkpoint from run ${{ github.run_number }}"
+          if ($hasState) {
+            git push origin training-state
+          } else {
+            git push --set-upstream origin training-state
+          }

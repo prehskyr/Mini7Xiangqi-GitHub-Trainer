@@ -1,0 +1,18 @@
+/build/
+/build-*/
+/.vs/
+/.idea/
+*.user
+*.suo
+
+# Runtime output on the source branch. The workflow publishes the latest model
+# to the dedicated training-state branch instead.
+/logs/*
+!/logs/.gitkeep
+/state/*
+!/state/.gitkeep
+/models/*.m7nnue
+!/models/.gitkeep
+
+# Local smoke tests
+/tests/*.tmp
