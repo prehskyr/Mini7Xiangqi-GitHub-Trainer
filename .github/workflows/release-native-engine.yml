@@ -1,0 +1,70 @@
+name: Package native Mini7 Windows engine
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+      - name: Download latest native candidate network
+        shell: pwsh
+        run: |
+          gh release download mini7-native-nnue-state --pattern mini7xiangqi-candidate.nnue --dir .
+          if (-not (Test-Path mini7xiangqi-candidate.nnue)) { throw 'No trained native candidate network exists.' }
+      - name: Build Windows engine
+        shell: msys2 {0}
+        working-directory: native/engine/src
+        run: make -j2 ARCH=x86-64-modern COMP=mingw largeboards=yes nnue=no build
+      - name: Verify network load
+        shell: msys2 {0}
+        run: python native/scripts/verify_nnue_load.py native/engine/src/stockfish.exe mini7xiangqi-candidate.nnue
+      - name: Create release archive
+        shell: pwsh
+        run: |
+          $dir = 'Mini7-Fairy-Stockfish-Windows-x64'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item native/engine/src/stockfish.exe "$dir/Mini7-Fairy-Stockfish.exe"
+          Copy-Item mini7xiangqi-candidate.nnue "$dir/mini7xiangqi-candidate.nnue"
+          Copy-Item native/engine/Copying.txt "$dir/LICENSE-GPLv3.txt"
+          @'
+          Engine variant: mini7xiangqi
+          Set UCI_Variant=mini7xiangqi
+          Set EvalFile to mini7xiangqi-candidate.nnue
+          Set Use NNUE=true
+          '@ | Set-Content -Encoding utf8 "$dir/README.txt"
+          $netHash = (Get-FileHash mini7xiangqi-candidate.nnue -Algorithm SHA256).Hash.ToLower()
+          $info = [ordered]@{
+            source_commit = $env:GITHUB_SHA
+            workflow_run = [int]$env:GITHUB_RUN_NUMBER
+            variant = 'mini7xiangqi'
+            network_sha256 = $netHash
+            build = 'windows-2022 / MSYS2 UCRT64 / x86-64-modern'
+          }
+          $info | ConvertTo-Json | Set-Content -Encoding utf8 "$dir/BUILD_INFO.json"
+          Compress-Archive -Path "$dir/*" -DestinationPath Mini7-Fairy-Stockfish-Windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mini7-Fairy-Stockfish-Windows-x64-${{ github.run_number }}
+          path: Mini7-Fairy-Stockfish-Windows-x64.zip
+          retention-days: 30
+      - name: Publish immutable GitHub release
+        shell: pwsh
+        run: |
+          $tag = "mini7-native-build-$env:GITHUB_RUN_NUMBER"
+          gh release create $tag Mini7-Fairy-Stockfish-Windows-x64.zip --target $env:GITHUB_SHA --title "Mini7 native engine build $env:GITHUB_RUN_NUMBER" --notes "Windows engine with a search-tree native NNUE candidate."

@@ -1,0 +1,131 @@
+name: Generate native Mini7 NNUE data
+
+on:
+  workflow_dispatch:
+    inputs:
+      train_positions:
+        description: Training positions to generate
+        required: true
+        default: "50000"
+      validation_positions:
+        description: Validation positions to generate
+        required: true
+        default: "5000"
+      search_depth:
+        description: Fixed teacher search depth
+        required: true
+        default: "5"
+      threads:
+        description: Generator threads (GitHub runner maximum recommended 4)
+        required: true
+        default: "4"
+      hash_mb:
+        description: Engine hash in MB
+        required: true
+        default: "1024"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mini7-native-data
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      TOOLS_COMMIT: c8df2c39515a2654d5b52ba55b4ee585b20430a8
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential git zstd
+      - name: Fetch pinned official data generator
+        run: |
+          git clone https://github.com/fairy-stockfish/variant-nnue-tools.git tools
+          git -C tools checkout "$TOOLS_COMMIT"
+          python3 native/scripts/patch_tools_engine.py tools
+      - name: Build data generator
+        working-directory: tools/src
+        run: make -j2 ARCH=x86-64-modern COMP=gcc largeboards=yes nnue=no build
+      - name: Generate trainer variant configuration
+        run: |
+          mkdir -p generated-config
+          printf 'trainer_config mini7xiangqi %s\nquit\n' "$GITHUB_WORKSPACE/generated-config" | tools/src/stockfish
+          test -s generated-config/variant.h
+          test -s generated-config/variant.py
+      - name: Generate training positions
+        shell: bash
+        run: |
+          mkdir -p data logs
+          cat > commands-train.txt <<EOF
+          uci
+          setoption name UCI_Variant value mini7xiangqi
+          setoption name Use NNUE value false
+          setoption name Threads value ${{ inputs.threads }}
+          setoption name Hash value ${{ inputs.hash_mb }}
+          isready
+          generate_training_data depth ${{ inputs.search_depth }} count ${{ inputs.train_positions }} output_file_name $GITHUB_WORKSPACE/data/train.bin random_move_min_ply 1 random_move_max_ply 18 random_move_count 5 random_multi_pv 4 random_multi_pv_diff 120 random_multi_pv_depth ${{ inputs.search_depth }} write_min_ply 4 write_max_ply 240 eval_limit 6000 keep_draws 0.40 filter_captures true filter_checks false filter_promotions false seed ${GITHUB_RUN_ID}-train set_recommended_uci_options data_format bin
+          quit
+          EOF
+          tools/src/stockfish < commands-train.txt 2>&1 | tee logs/train-generator.log
+          test -s data/train.bin
+      - name: Generate validation positions
+        shell: bash
+        run: |
+          cat > commands-val.txt <<EOF
+          uci
+          setoption name UCI_Variant value mini7xiangqi
+          setoption name Use NNUE value false
+          setoption name Threads value ${{ inputs.threads }}
+          setoption name Hash value ${{ inputs.hash_mb }}
+          isready
+          generate_training_data depth ${{ inputs.search_depth }} count ${{ inputs.validation_positions }} output_file_name $GITHUB_WORKSPACE/data/validation.bin random_move_min_ply 1 random_move_max_ply 18 random_move_count 5 random_multi_pv 4 random_multi_pv_diff 120 random_multi_pv_depth ${{ inputs.search_depth }} write_min_ply 4 write_max_ply 240 eval_limit 6000 keep_draws 0.40 filter_captures true filter_checks false filter_promotions false seed ${GITHUB_RUN_ID}-validation set_recommended_uci_options data_format bin
+          quit
+          EOF
+          tools/src/stockfish < commands-val.txt 2>&1 | tee logs/validation-generator.log
+          test -s data/validation.bin
+      - name: Compress and record metadata
+        run: |
+          TRAIN_NAME="mini7-train-run-${GITHUB_RUN_NUMBER}.bin.zst"
+          VAL_NAME="mini7-validation-run-${GITHUB_RUN_NUMBER}.bin.zst"
+          zstd -T0 -6 data/train.bin -o "$TRAIN_NAME"
+          zstd -T0 -6 data/validation.bin -o "$VAL_NAME"
+          sha256sum "$TRAIN_NAME" "$VAL_NAME" > SHA256SUMS.txt
+          cat > data-metadata.json <<EOF
+          {
+            "run_number": ${GITHUB_RUN_NUMBER},
+            "run_id": ${GITHUB_RUN_ID},
+            "engine_commit": "${GITHUB_SHA}",
+            "tools_commit": "${TOOLS_COMMIT}",
+            "variant": "mini7xiangqi",
+            "train_positions": ${{ inputs.train_positions }},
+            "validation_positions": ${{ inputs.validation_positions }},
+            "search_depth": ${{ inputs.search_depth }},
+            "threads": ${{ inputs.threads }},
+            "hash_mb": ${{ inputs.hash_mb }}
+          }
+          EOF
+          echo "TRAIN_NAME=$TRAIN_NAME" >> "$GITHUB_ENV"
+          echo "VAL_NAME=$VAL_NAME" >> "$GITHUB_ENV"
+      - name: Publish rolling data release
+        run: |
+          gh release view mini7-native-data >/dev/null 2>&1 || \
+            gh release create mini7-native-data --target "$GITHUB_SHA" --title "Mini7 native NNUE data" --notes "Rolling native mini7xiangqi training-data shards."
+          gh release upload mini7-native-data \
+            "$TRAIN_NAME" "$VAL_NAME" generated-config/variant.h generated-config/variant.py \
+            data-metadata.json SHA256SUMS.txt --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mini7-native-data-run-${{ github.run_number }}
+          path: |
+            ${{ env.TRAIN_NAME }}
+            ${{ env.VAL_NAME }}
+            generated-config/variant.h
+            generated-config/variant.py
+            data-metadata.json
+            SHA256SUMS.txt
+            logs/*.log
+          retention-days: 14

@@ -1,0 +1,164 @@
+name: Train native Mini7 NNUE on GitHub CPU
+
+on:
+  workflow_dispatch:
+    inputs:
+      epoch_positions:
+        description: Positions processed in this training round
+        required: true
+        default: "200000"
+      validation_positions:
+        description: Positions processed during validation
+        required: true
+        default: "20000"
+      batch_size:
+        description: CPU batch size
+        required: true
+        default: "64"
+      lambda_eval:
+        description: Loss mixture, 1=search score and 0=game result
+        required: true
+        default: "0.80"
+      learning_rate_note:
+        description: Informational label (optimizer LR is controlled by official model)
+        required: false
+        default: "official-default"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mini7-native-train
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      TRAINER_COMMIT: b15df38a9aae8ab9b40b2378020b3099c7c5d179
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git zstd
+      - name: Install CPU training dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.1.2"
+          python -m pip install "numpy<2" chess matplotlib "pytorch-lightning==1.9.5" \
+            "torchmetrics==0.11.4" tensorboard
+      - name: Fetch and patch pinned official trainer
+        run: |
+          git clone https://github.com/fairy-stockfish/variant-nnue-pytorch.git trainer
+          git -C trainer checkout "$TRAINER_COMMIT"
+          python native/scripts/patch_trainer_cpu.py trainer
+      - name: Download all published Mini7 data shards
+        run: |
+          mkdir -p data
+          gh release download mini7-native-data --pattern 'mini7-train-*.bin.zst' --dir data
+          gh release download mini7-native-data --pattern 'mini7-validation-*.bin.zst' --dir data
+          gh release download mini7-native-data --pattern 'variant.h' --dir trainer
+          gh release download mini7-native-data --pattern 'variant.py' --dir trainer
+          test -n "$(find data -name 'mini7-train-*.bin.zst' -print -quit)"
+          test -n "$(find data -name 'mini7-validation-*.bin.zst' -print -quit)"
+          test -s trainer/variant.h
+          test -s trainer/variant.py
+      - name: Assemble binary datasets
+        run: |
+          zstd -dc data/mini7-train-*.bin.zst > trainer/train.bin
+          zstd -dc data/mini7-validation-*.bin.zst > trainer/validation.bin
+          test -s trainer/train.bin
+          test -s trainer/validation.bin
+          ls -lh trainer/train.bin trainer/validation.bin
+      - name: Build official fast data loader
+        working-directory: trainer
+        run: |
+          cmake . -Bbuild -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD"
+          cmake --build build --config Release --target install -j2
+          ls -l *training_data_loader*
+      - name: Test pure-PyTorch CPU accumulator
+        working-directory: trainer
+        run: python test_cpu_backend.py
+      - name: Restore latest checkpoint when available
+        run: |
+          mkdir -p resume
+          gh release download mini7-native-nnue-state --pattern 'latest.ckpt' --dir resume 2>/dev/null || true
+          if test -s resume/latest.ckpt; then
+            echo "RESUME_ARG=--resume_from_checkpoint $GITHUB_WORKSPACE/resume/latest.ckpt" >> "$GITHUB_ENV"
+            echo "Resuming from the previous checkpoint."
+          else
+            echo "RESUME_ARG=" >> "$GITHUB_ENV"
+            echo "No checkpoint exists; starting the first native network."
+          fi
+      - name: Train one resumable CPU round
+        working-directory: trainer
+        shell: bash
+        run: |
+          python train.py train.bin validation.bin \
+            --accelerator cpu --devices 1 \
+            --max_epochs 1 \
+            --batch-size '${{ inputs.batch_size }}' \
+            --threads 4 --num-workers 1 \
+            --epoch-size '${{ inputs.epoch_positions }}' \
+            --validation-size '${{ inputs.validation_positions }}' \
+            --random-fen-skipping 0 \
+            --lambda '${{ inputs.lambda_eval }}' \
+            --features 'HalfKAv2^' \
+            --default_root_dir "$GITHUB_WORKSPACE/training-run" \
+            --log_every_n_steps 10 \
+            $RESUME_ARG
+      - name: Select checkpoint and serialize native NNUE
+        run: |
+          CHECKPOINT="$(find training-run -name '*.ckpt' -type f -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+          test -n "$CHECKPOINT"
+          cp "$CHECKPOINT" latest.ckpt
+          cd trainer
+          python serialize.py "$GITHUB_WORKSPACE/latest.ckpt" "$GITHUB_WORKSPACE/mini7xiangqi-candidate.nnue" \
+            --features 'HalfKAv2^' \
+            --description "Mini7 native NNUE GitHub run ${GITHUB_RUN_NUMBER}"
+          test -s "$GITHUB_WORKSPACE/mini7xiangqi-candidate.nnue"
+      - name: Build native engine and load-test exported network
+        working-directory: native/engine/src
+        run: make -j2 ARCH=x86-64-modern COMP=gcc largeboards=yes nnue=no build
+      - name: Verify NNUE inside the search tree
+        run: python3 native/scripts/verify_nnue_load.py native/engine/src/stockfish mini7xiangqi-candidate.nnue
+      - name: Record training state
+        run: |
+          sha256sum latest.ckpt mini7xiangqi-candidate.nnue > SHA256SUMS.txt
+          cat > native-training-state.json <<EOF
+          {
+            "run_number": ${GITHUB_RUN_NUMBER},
+            "run_id": ${GITHUB_RUN_ID},
+            "source_commit": "${GITHUB_SHA}",
+            "trainer_commit": "${TRAINER_COMMIT}",
+            "variant": "mini7xiangqi",
+            "epoch_positions": ${{ inputs.epoch_positions }},
+            "validation_positions": ${{ inputs.validation_positions }},
+            "batch_size": ${{ inputs.batch_size }},
+            "lambda_eval": ${{ inputs.lambda_eval }},
+            "backend": "github-hosted-cpu",
+            "network": "mini7xiangqi-candidate.nnue"
+          }
+          EOF
+      - name: Publish rolling checkpoint and candidate network
+        run: |
+          gh release view mini7-native-nnue-state >/dev/null 2>&1 || \
+            gh release create mini7-native-nnue-state --target "$GITHUB_SHA" --title "Mini7 native NNUE state" --notes "Rolling CPU checkpoint and native candidate network."
+          gh release upload mini7-native-nnue-state \
+            latest.ckpt mini7xiangqi-candidate.nnue native-training-state.json SHA256SUMS.txt --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mini7-native-nnue-run-${{ github.run_number }}
+          path: |
+            latest.ckpt
+            mini7xiangqi-candidate.nnue
+            native-training-state.json
+            SHA256SUMS.txt
+            training-run/lightning_logs/**
+          retention-days: 30

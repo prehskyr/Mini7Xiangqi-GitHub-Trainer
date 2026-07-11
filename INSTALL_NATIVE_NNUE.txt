@@ -1,0 +1,14 @@
+Mini7 Native NNUE GitHub Pipeline v0.1.0
+
+This ZIP is an overlay for the existing repository:
+  prehskyr/Mini7Xiangqi-GitHub-Trainer
+
+Installation:
+1. Extract the ZIP directly into the local repository root.
+2. Confirm that these paths now exist:
+     native/engine/src/Makefile
+     .github/workflows/native-engine-ci.yml
+3. Double-click commit_native_pipeline.cmd.
+4. Open GitHub Actions and wait for "Native Mini7 engine CI".
+
+The script only commits and pushes source/workflow files. It does not train or compile on the local PC.
