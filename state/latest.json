@@ -1,0 +1,23 @@
+{
+  "final": true,
+  "stop_reason": "game_limit",
+  "elapsed_seconds": 135,
+  "configured_duration_seconds": 300,
+  "games_completed": 10,
+  "red_wins": 4,
+  "black_wins": 5,
+  "draws": 1,
+  "current_game": 10,
+  "current_ply": 66,
+  "starting_steps": 0,
+  "ending_steps": 2236,
+  "teacher_updates": 1113,
+  "outcome_updates": 1123,
+  "threads": 4,
+  "hash_mb": 1024,
+  "movetime_ms": 120,
+  "max_plies": 240,
+  "multipv": 5,
+  "net_blend_percent": 20,
+  "learning_rate": 0.0020000001
+}
