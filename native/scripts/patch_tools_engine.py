@@ -22,6 +22,33 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+def insert_in_function_once(
+    text: str,
+    function_start: str,
+    function_end: str,
+    marker: str,
+    insertion: str,
+    already_present: str,
+    label: str,
+) -> str:
+    """Insert immediately after marker, but only inside one named function."""
+    start = text.find(function_start)
+    end = text.find(function_end, start + len(function_start))
+    if start < 0 or end < 0:
+        raise RuntimeError(f"{label}: function boundaries not found")
+
+    segment = text[start:end]
+    if already_present in segment:
+        return text
+
+    count = segment.count(marker)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected one marker in function, found {count}")
+
+    segment = segment.replace(marker, marker + insertion, 1)
+    return text[:start] + segment + text[end:]
+
+
 def patch(root: Path) -> None:
     src = root / "src"
 
@@ -114,9 +141,12 @@ def patch(root: Path) -> None:
         segment = s[do_move_start:do_move_end]
         marker = "  Piece pc = moved_piece(m);\n"
         if segment.count(marker) != 1:
-            raise RuntimeError(f"position.cpp moved piece: expected one marker in do_move, found {segment.count(marker)}")
+            raise RuntimeError(
+                f"position.cpp moved piece: expected one marker in do_move, found {segment.count(marker)}"
+            )
         segment = segment.replace(marker, marker + "  st->movedPiece = pc;\n", 1)
         s = s[:do_move_start] + segment + s[do_move_end:]
+
     check_marker = (
         "  st->checkersBB = givesCheck ? attackers_to(square<KING>(them), us) & pieces(us) : Bitboard(0);\n"
         "  assert(givesCheck == bool(st->checkersBB));\n"
@@ -140,16 +170,21 @@ def patch(root: Path) -> None:
         "  }\n"
     )
     s = replace_once(s, check_marker, check_block, "position.cpp rook streak")
-    s = replace_once(
+
+    # Upstream contains a '// Used by NNUE' line here. Match the function and
+    # assignment only, rather than depending on comments or blank-line layout.
+    s = insert_in_function_once(
         s,
-        "  newSt.previous = st;\n  st = &newSt;\n\n  st->dirtyPiece.dirty_num = 0;\n",
-        "  newSt.previous = st;\n  st = &newSt;\n\n"
-        "  st->movedPiece = NO_PIECE;\n"
+        "void Position::do_null_move(StateInfo& newSt)",
+        "void Position::undo_null_move()",
+        "  st = &newSt;\n",
+        "\n  st->movedPiece = NO_PIECE;\n"
         "  st->rookCheckStreak = 0;\n"
-        "  st->rookCheckViolation = false;\n"
-        "  st->dirtyPiece.dirty_num = 0;\n",
+        "  st->rookCheckViolation = false;\n",
+        "  st->rookCheckViolation = false;\n",
         "position.cpp null move",
     )
+
     immediate = "bool Position::is_immediate_game_end(Value& result, int ply) const {\n\n"
     immediate_new = immediate + (
         "  // The player who delivered the configured consecutive rook checks loses.\n"
