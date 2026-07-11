@@ -52,3 +52,6 @@ echo.
 echo Operation failed. Read the Git error above; no local training was started.
 pause
 exit /b 1
+
+git add -f native/engine/src/Makefile native/engine/src/Makefile_js
+
