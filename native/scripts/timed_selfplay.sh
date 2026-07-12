@@ -10,10 +10,33 @@ set -euo pipefail
 : "${SELFPLAY_DEADLINE:?SELFPLAY_DEADLINE is required}"
 : "${DATA_CAP_BYTES:?DATA_CAP_BYTES is required}"
 
-if ! [[ "$SEARCH_DEPTH" =~ ^[0-9]+$ ]] || (( SEARCH_DEPTH < 1 || SEARCH_DEPTH > 12 )); then
-  echo "::error::SEARCH_DEPTH must be an integer between 1 and 12"
+# The upstream generator does not impose a depth-12 ceiling. The wall-clock
+# budget bounds total compute, so only require a positive integer.
+if ! [[ "$SEARCH_DEPTH" =~ ^[1-9][0-9]*$ ]]; then
+  echo "::error::SEARCH_DEPTH must be a positive integer"
   exit 1
 fi
+
+# Higher fixed depths make each generated position much more expensive. Reduce
+# only the chunk granularity (not the total wall-clock budget) so the timer is
+# checked frequently enough and a single chunk cannot consume the entire job.
+EFFECTIVE_CHUNK_POSITIONS="$SELFPLAY_CHUNK_POSITIONS"
+EFFECTIVE_VALIDATION_POSITIONS="$VALIDATION_POSITIONS"
+
+if (( SEARCH_DEPTH >= 17 )); then
+  EFFECTIVE_CHUNK_POSITIONS=250
+  EFFECTIVE_VALIDATION_POSITIONS=2000
+elif (( SEARCH_DEPTH >= 13 )); then
+  EFFECTIVE_CHUNK_POSITIONS=1000
+  EFFECTIVE_VALIDATION_POSITIONS=5000
+elif (( SEARCH_DEPTH >= 9 )); then
+  EFFECTIVE_CHUNK_POSITIONS=5000
+  EFFECTIVE_VALIDATION_POSITIONS=10000
+fi
+
+echo "Self-play search depth: $SEARCH_DEPTH"
+echo "Self-play chunk positions: $EFFECTIVE_CHUNK_POSITIONS"
+echo "Validation positions: $EFFECTIVE_VALIDATION_POSITIONS"
 
 mkdir -p data logs
 : > data/fresh-train.bin
@@ -41,7 +64,7 @@ SELFPLAY_START="$(date +%s)"
 
 write_generator_commands \
   "$GITHUB_WORKSPACE/data/fresh-validation.bin" \
-  "$VALIDATION_POSITIONS" \
+  "$EFFECTIVE_VALIDATION_POSITIONS" \
   "${GITHUB_RUN_ID}-validation" \
   "commands-validation.txt"
 
@@ -57,8 +80,6 @@ while true; do
   NOW="$(date +%s)"
   CURRENT_BYTES="$(stat -c%s data/fresh-train.bin)"
 
-  # Always complete at least one self-play chunk. After that, stop before the
-  # deadline with enough margin to finish and append the current chunk.
   if (( CHUNK_INDEX > 0 && NOW >= SELFPLAY_DEADLINE - 20 )); then
     echo "Self-play timer reached."
     break
@@ -74,7 +95,7 @@ while true; do
 
   write_generator_commands \
     "$CHUNK_FILE" \
-    "$SELFPLAY_CHUNK_POSITIONS" \
+    "$EFFECTIVE_CHUNK_POSITIONS" \
     "${GITHUB_RUN_ID}-${CHUNK_INDEX}" \
     "$COMMAND_FILE"
 
@@ -85,7 +106,7 @@ while true; do
   cat "$CHUNK_FILE" >> data/fresh-train.bin
   rm -f "$CHUNK_FILE" "$COMMAND_FILE"
 
-  GENERATED_POSITIONS=$((GENERATED_POSITIONS + SELFPLAY_CHUNK_POSITIONS))
+  GENERATED_POSITIONS=$((GENERATED_POSITIONS + EFFECTIVE_CHUNK_POSITIONS))
 
   if (( CHUNK_INDEX % 10 == 0 )); then
     CURRENT_BYTES="$(stat -c%s data/fresh-train.bin)"
@@ -103,6 +124,8 @@ FRESH_DATA_BYTES="$(stat -c%s data/fresh-train.bin)"
   echo "GENERATED_POSITIONS=$GENERATED_POSITIONS"
   echo "SELFPLAY_ELAPSED_SECONDS=$SELFPLAY_ELAPSED"
   echo "FRESH_DATA_BYTES=$FRESH_DATA_BYTES"
+  echo "VALIDATION_POSITIONS=$EFFECTIVE_VALIDATION_POSITIONS"
+  echo "EFFECTIVE_SELFPLAY_CHUNK_POSITIONS=$EFFECTIVE_CHUNK_POSITIONS"
 } >> "$GITHUB_ENV"
 
 echo "Fresh self-play positions: $GENERATED_POSITIONS"
